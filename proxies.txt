@@ -1,0 +1,12 @@
+# 代理IP列表
+# 格式支持:
+#   ip:port                    (默认HTTP)
+#   protocol://ip:port         (指定协议)
+#   ip:port:user:pass          (带认证)
+#   protocol://user:pass@ip:port (标准格式)
+#
+# 示例:
+# 192.168.1.1:8080
+# socks5://192.168.1.1:1080
+# 192.168.1.1:8080:user:pass
+# http://user:pass@192.168.1.1:8080

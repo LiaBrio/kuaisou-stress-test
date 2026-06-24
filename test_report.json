@@ -1,0 +1,29 @@
+{
+  "summary": {
+    "total_requests": 10,
+    "success_count": 10,
+    "failure_count": 0,
+    "success_rate": "100.00%",
+    "duration_seconds": "2.29",
+    "requests_per_second": "4.37"
+  },
+  "response_time": {
+    "min_ms": "310.83",
+    "max_ms": "1284.76",
+    "avg_ms": "553.36",
+    "p50_ms": "489.16",
+    "p90_ms": "1284.76",
+    "p95_ms": "1284.76",
+    "p99_ms": "1284.76",
+    "distribution": {
+      "200-500ms": 6,
+      "500-1000ms": 3,
+      "1000-2000ms": 1
+    }
+  },
+  "status_codes": {
+    "200": 10
+  },
+  "error_breakdown": {},
+  "rps_over_time": []
+}

@@ -1,0 +1,40 @@
+# 代理池 + 压力测试 一键部署
+# 使用方法: docker-compose up -d
+#
+# 包含:
+#   - Redis: 代理池数据存储
+#   - proxy_pool: 代理池服务 (jhao104/proxy_pool)
+#     API: http://127.0.0.1:5010
+#     文档: https://github.com/jhao104/proxy_pool
+#
+# 启动后，运行压力测试:
+#   python3 main.py --proxy-pool http://127.0.0.1:5010 --proxy-strategy proxy_pool --concurrent 20 --total 200
+
+version: "3"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: proxy_pool_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  proxy_pool:
+    image: jhao104/proxy_pool:latest
+    container_name: proxy_pool
+    ports:
+      - "5010:5010"
+    environment:
+      - DB_CONN=redis://redis:6379/0
+      - HOST=0.0.0.0
+      - PORT=5010
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis_data:
