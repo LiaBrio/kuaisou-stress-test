@@ -11,6 +11,7 @@ import logging
 from typing import List, Optional, Dict
 from dataclasses import dataclass, field
 from config import StressTestConfig
+from proxy_sources import MultiSourceFetcher, ProxyValidator, RawProxy
 
 logger = logging.getLogger("ip_pool")
 
@@ -56,7 +57,7 @@ class IPPoolManager:
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
 
-    async def initialize(self):
+    async def initialize(self, skip_validate: bool = False):
         """初始化IP池"""
         logger.info("正在初始化IP池...")
 
@@ -69,8 +70,15 @@ class IPPoolManager:
                 logger.info(f"从 proxy_pool 加载了 {len(pool_proxies)} 个代理")
                 self._proxies.extend(pool_proxies)
 
-        # 2. 从 FreeProxy 加载 (CharlesPikachu/FreeProxy, 无需Docker)
-        if self.config.use_freeproxy:
+        # 2. 从多源抓取代理 (proxy_sources.py)
+        if self.config.proxy_multi_source:
+            ms_proxies = await self._load_from_multi_source()
+            if ms_proxies:
+                logger.info(f"从多源抓取了 {len(ms_proxies)} 个代理")
+                self._proxies.extend(ms_proxies)
+
+        # 3. 从 FreeProxy 加载 (CharlesPikachu/FreeProxy, 无需Docker)
+        if self.config.use_freeproxy and not self.config.proxy_multi_source:
             fp_proxies = await self._load_from_freeproxy()
             if fp_proxies:
                 logger.info(f"从 FreeProxy 加载了 {len(fp_proxies)} 个代理")
@@ -90,8 +98,11 @@ class IPPoolManager:
                 self._proxies.extend(api_proxies)
 
         # 验证代理可用性
-        skip_validate = self._use_proxy_pool  # proxy_pool自身已验证
-        if self._proxies and not skip_validate:
+        if skip_validate and self._proxies:
+            for p in self._proxies:
+                p.is_alive = True
+            logger.info(f"跳过验证，直接使用 {len(self._proxies)} 个代理")
+        elif self._proxies and not self._use_proxy_pool:
             await self._validate_all()
         elif self._use_proxy_pool and self._proxies:
             for p in self._proxies:
@@ -298,6 +309,34 @@ class IPPoolManager:
             logger.error(f"从API加载代理失败: {e}")
         return proxies
 
+    # ==================== 多源抓取 ====================
+
+    async def _load_from_multi_source(self) -> List[ProxyInfo]:
+        """使用 MultiSourceFetcher 从多个源并发抓取代理"""
+        proxies = []
+        try:
+            fetcher = MultiSourceFetcher(timeout=10.0, max_per_source=200)
+            raw_proxies = await fetcher.fetch_all()
+
+            for rp in raw_proxies:
+                proxies.append(ProxyInfo(
+                    url=rp.url,
+                    protocol=rp.protocol,
+                    is_alive=True,  # 后续验证阶段会筛选
+                ))
+
+            # 打印各源统计
+            for sr in fetcher.get_source_stats():
+                status = "✓" if sr.count > 0 else "✗"
+                err = f" ({sr.error})" if sr.error else ""
+                print(f"    {status} [{sr.name}] {sr.count} 个 ({sr.elapsed_ms:.0f}ms){err}")
+
+            await fetcher.close()
+        except Exception as e:
+            logger.error(f"多源抓取失败: {e}")
+
+        return proxies
+
     # ==================== FreeProxy 集成 ====================
 
     async def _load_from_freeproxy(self) -> List[ProxyInfo]:
@@ -400,33 +439,53 @@ class IPPoolManager:
     # ==================== 验证 ====================
 
     async def _validate_all(self):
-        """验证所有代理的可用性"""
+        """验证所有代理的可用性 (使用改进的ProxyValidator)"""
+        if not self._proxies:
+            return
+
         logger.info(f"正在验证 {len(self._proxies)} 个代理...")
-        semaphore = asyncio.Semaphore(20)
+        print(f"  验证中: {len(self._proxies)} 个代理 "
+              f"(并发={self.config.proxy_validate_concurrency}, "
+              f"超时={self.config.proxy_validate_timeout}s, "
+              f"重试={self.config.proxy_validate_retry})")
 
-        async def validate_one(proxy: ProxyInfo):
-            async with semaphore:
-                is_valid = await self._validate_proxy(proxy)
-                proxy.is_alive = is_valid
+        # 构建目标站验证URL
+        target_url = None
+        if self.config.proxy_validate_target:
+            target_url = self.config.register_url or self.config.send_code_url
 
-        tasks = [validate_one(p) for p in self._proxies]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        validator = ProxyValidator(
+            validate_url=self.config.proxy_validate_url,
+            timeout=float(self.config.proxy_validate_timeout),
+            concurrency=self.config.proxy_validate_concurrency,
+            retry_count=self.config.proxy_validate_retry,
+            target_url=target_url,
+        )
 
-    async def _validate_proxy(self, proxy: ProxyInfo) -> bool:
-        """验证单个代理是否可用"""
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.config.proxy_validate_timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    self.config.proxy_validate_url,
-                    proxy=proxy.url
-                ) as resp:
-                    if resp.status == 200:
-                        proxy.last_check = time.time()
-                        return True
-        except Exception:
-            return False
-        return False
+        # 将 ProxyInfo 转为 RawProxy 进行验证
+        raw_proxies = [
+            RawProxy(url=p.url, source="local", protocol=p.protocol)
+            for p in self._proxies
+        ]
+
+        valid = await validator.validate_batch(raw_proxies)
+        valid_urls = {p.url for p in valid}
+
+        # 更新 ProxyInfo 状态
+        for p in self._proxies:
+            if p.url in valid_urls:
+                p.is_alive = True
+                p.last_check = time.time()
+                # 找到对应的 RawProxy 获取速度信息
+                for vp in valid:
+                    if vp.url == p.url:
+                        p.avg_response_time = vp.speed_ms
+                        break
+            else:
+                p.is_alive = False
+
+        alive_count = sum(1 for p in self._proxies if p.is_alive)
+        print(f"  验证完成: {alive_count}/{len(self._proxies)} 个代理可用")
 
     # ==================== 获取 & 报告 ====================
 

@@ -21,6 +21,7 @@ from typing import List
 from config import StressTestConfig
 from ip_pool import IPPoolManager
 from register import RegisterSimulator
+from sms import SendCodeSimulator
 from stats import TestStats, print_live_stats, print_final_report
 from discover import APIDiscoverer
 
@@ -62,6 +63,9 @@ def parse_args():
   python main.py --proxy-api "http://your-proxy-api.com/get" --proxy-file proxies.txt
         """,
     )
+    parser.add_argument("--test-mode", type=str, default="register",
+                        choices=["register", "sms"],
+                        help="测试模式: register注册(默认)/sms短信发送")
     parser.add_argument("--concurrent", type=int, default=10,
                         help="并发用户数 (默认: 10)")
     parser.add_argument("--total", type=int, default=100,
@@ -91,10 +95,26 @@ def parse_args():
                         help="启用FreeProxy内置代理抓取(无需Docker, pip install freeproxy)")
     parser.add_argument("--freeproxy-https-only", action="store_true",
                         help="FreeProxy仅获取HTTPS代理(默认获取全部, HTTP代理也能转发HTTPS)")
+    parser.add_argument("--multi-source", action="store_true",
+                        help="启用多源并发抓取代理(free-proxy-list+us-proxy+proxydb等)")
+    parser.add_argument("--validate-target", action="store_true", default=True,
+                        help="用目标站URL验证代理(默认启用, 比httpbin更准)")
+    parser.add_argument("--no-validate-target", action="store_true",
+                        help="禁用目标站验证, 仅用httpbin.org验证")
+    parser.add_argument("--validate-timeout", type=int, default=8,
+                        help="代理验证超时/秒 (默认: 8)")
+    parser.add_argument("--validate-concurrent", type=int, default=30,
+                        help="代理验证并发数 (默认: 30)")
+    parser.add_argument("--validate-retry", type=int, default=1,
+                        help="代理验证失败重试次数 (默认: 1)")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="跳过代理验证，直接使用所有代理")
     parser.add_argument("--no-proxy", action="store_true",
                         help="不使用代理IP")
     parser.add_argument("--no-delay", action="store_true",
                         help="不添加随机延迟")
+    parser.add_argument("--sms-scene", type=str, default="auto",
+                        help="短信接口scene参数 (默认: auto)")
     parser.add_argument("--register-url", type=str, default=None,
                         help="注册接口URL (覆盖默认值)")
     parser.add_argument("--submit-mode", type=str, default="json",
@@ -104,6 +124,8 @@ def parse_args():
                         help="禁用API接口自动探测")
     parser.add_argument("--report", type=str, default="stress_test_report.json",
                         help="报告输出文件 (默认: stress_test_report.json)")
+    parser.add_argument("--burst", action="store_true",
+                        help="瞬时爆发模式：所有请求同时发出，无爬升无间隔")
     parser.add_argument("--step-test", action="store_true",
                         help="启用阶梯递增加压模式")
     parser.add_argument("--max-concurrent", type=int, default=50,
@@ -122,66 +144,92 @@ async def run_fixed_load_test(
     ip_pool: IPPoolManager,
     stats: TestStats,
     submit_mode: str = "auto",
+    test_mode: str = "register",
+    sms_scene: str = "auto",
+    burst: bool = False,
 ) -> TestStats:
-    """固定并发量压力测试"""
-    simulator = RegisterSimulator(config, ip_pool, submit_mode=submit_mode)
+    """固定并发量压力测试，burst=True时为瞬时爆发模式"""
+    if test_mode == "sms":
+        simulator = SendCodeSimulator(config, ip_pool, scene=sms_scene)
+    else:
+        simulator = RegisterSimulator(config, ip_pool, submit_mode=submit_mode)
     semaphore = asyncio.Semaphore(config.concurrent_users)
 
     stats.start_time = time.time()
 
     async def worker(task_id: int):
         async with semaphore:
-            result = await simulator.execute_register()
+            if test_mode == "sms":
+                result = await simulator.execute_send_code()
+            else:
+                result = await simulator.execute_register()
             stats.record(result)
 
-    # 逐步增加并发(ramp-up)
-    tasks: List[asyncio.Task] = []
-    interval_per_task = config.ramp_up_seconds / config.concurrent_users
+    if burst:
+        # === 瞬时爆发模式 ===
+        print(f"\n💥 瞬时爆发测试: 并发={config.concurrent_users}, 总请求={config.total_requests}")
+        print(f"   所有请求将同时发出，无爬升无延迟\n")
 
-    print(f"\n🚀 开始压力测试: 并发={config.concurrent_users}, 总请求={config.total_requests}")
-    print(f"   爬升时间={config.ramp_up_seconds}s, 请求间隔={config.request_interval_min}-{config.request_interval_max}s")
-    print(f"   按 Ctrl+C 可提前终止测试\n")
+        tasks = [asyncio.create_task(worker(i)) for i in range(config.total_requests)]
 
-    launched = 0
-    try:
-        # 分批启动任务
-        while launched < config.total_requests:
-            batch_size = min(
-                config.concurrent_users,
-                config.total_requests - launched,
-            )
-            for i in range(batch_size):
-                task = asyncio.create_task(worker(launched + i))
-                tasks.append(task)
-            launched += batch_size
+        try:
+            # 实时打印进度
+            while not all(t.done() for t in tasks):
+                await asyncio.sleep(0.5)
+                print_live_stats(stats)
+        except KeyboardInterrupt:
+            print("\n\n⚠ 收到中断信号，正在等待当前请求完成...")
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-            # 等待ramp-up间隔
-            if launched < config.total_requests:
-                await asyncio.sleep(interval_per_task)
-
-            # 等待当前批次部分完成
-            done, pending = await asyncio.wait(
-                tasks, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
-            )
-            tasks = list(pending)
-
-            # 打印实时统计
-            print_live_stats(stats)
-
-    except KeyboardInterrupt:
-        print("\n\n⚠ 收到中断信号，正在等待当前请求完成...")
-        # 取消未开始的任务
-        for t in tasks:
-            t.cancel()
-        # 等待进行中的任务完成
+        # 确保全部完成
         await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        # === 常规固定负载模式 ===
+        interval_per_task = config.ramp_up_seconds / config.concurrent_users
 
-    # 等待所有剩余任务完成
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"\n🚀 开始压力测试: 并发={config.concurrent_users}, 总请求={config.total_requests}")
+        print(f"   爬升时间={config.ramp_up_seconds}s, 请求间隔={config.request_interval_min}-{config.request_interval_max}s")
+        print(f"   按 Ctrl+C 可提前终止测试\n")
+
+        tasks: List[asyncio.Task] = []
+        launched = 0
+        try:
+            while launched < config.total_requests:
+                batch_size = min(
+                    config.concurrent_users,
+                    config.total_requests - launched,
+                )
+                for i in range(batch_size):
+                    task = asyncio.create_task(worker(launched + i))
+                    tasks.append(task)
+                launched += batch_size
+
+                if launched < config.total_requests:
+                    await asyncio.sleep(interval_per_task)
+
+                done, pending = await asyncio.wait(
+                    tasks, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+                )
+                tasks = list(pending)
+                print_live_stats(stats)
+
+        except KeyboardInterrupt:
+            print("\n\n⚠ 收到中断信号，正在等待当前请求完成...")
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     stats.end_time = time.time()
-    print()  # 换行
+    # 关闭模拟器Session
+    if hasattr(simulator, 'close'):
+        await simulator.close()
+    print()
     return stats
 
 
@@ -193,9 +241,14 @@ async def run_step_load_test(
     step_size: int,
     step_duration: int,
     submit_mode: str = "auto",
+    test_mode: str = "register",
+    sms_scene: str = "auto",
 ) -> TestStats:
     """阶梯递增加压测试"""
-    simulator = RegisterSimulator(config, ip_pool, submit_mode=submit_mode)
+    if test_mode == "sms":
+        simulator = SendCodeSimulator(config, ip_pool, scene=sms_scene)
+    else:
+        simulator = RegisterSimulator(config, ip_pool, submit_mode=submit_mode)
 
     stats.start_time = time.time()
     current_concurrent = step_size
@@ -217,7 +270,10 @@ async def run_step_load_test(
 
             async def worker():
                 async with semaphore:
-                    result = await simulator.execute_register()
+                    if test_mode == "sms":
+                        result = await simulator.execute_send_code()
+                    else:
+                        result = await simulator.execute_register()
                     stats.record(result)
                     step_stats.record(result)
 
@@ -280,6 +336,11 @@ async def main():
         proxy_refresh_interval=args.proxy_refresh,
         use_freeproxy=args.freeproxy,
         freeproxy_https_only=args.freeproxy_https_only,
+        proxy_multi_source=args.multi_source,
+        proxy_validate_target=not args.no_validate_target,
+        proxy_validate_timeout=args.validate_timeout,
+        proxy_validate_concurrency=args.validate_concurrent,
+        proxy_validate_retry=args.validate_retry,
         random_delay=not args.no_delay,
         report_file=args.report,
     )
@@ -300,8 +361,9 @@ async def main():
     setup_logging(config.log_file, args.verbose)
 
     # 打印Banner
+    mode_name = "短信发送" if args.test_mode == "sms" else "注册功能"
     print("=" * 60)
-    print("  快搜(kuaisou.com)注册功能压力测试工具")
+    print(f"  快搜(kuaisou.com) {mode_name}压力测试工具")
     print("=" * 60)
 
     # 自动探测注册API接口
@@ -323,8 +385,12 @@ async def main():
         finally:
             await discoverer.close()
     else:
-        print(f"\n  注册接口: {config.register_url}")
-        print(f"  提交模式: {submit_mode}")
+        if args.test_mode == "sms":
+            print(f"\n  短信接口: {config.send_code_url}")
+            print(f"  scene: {args.sms_scene}")
+        else:
+            print(f"\n  注册接口: {config.register_url}")
+            print(f"  提交模式: {submit_mode}")
 
     print(f"\n  目标页面: {config.login_page_url}")
     print()
@@ -332,7 +398,7 @@ async def main():
     # 初始化IP池
     ip_pool = IPPoolManager(config)
     if use_proxy:
-        await ip_pool.initialize()
+        await ip_pool.initialize(skip_validate=args.no_validate)
     else:
         print("\n⚠ 未启用代理IP，将使用本机IP直接请求")
         print("  注意：不使用代理可能导致本机IP被目标网站封禁")
@@ -342,17 +408,23 @@ async def main():
 
     try:
         if args.step_test:
-            # 阶梯加压模式
             await run_step_load_test(
                 config, ip_pool, stats,
                 max_concurrent=args.max_concurrent,
                 step_size=args.step_size,
                 step_duration=args.step_duration,
                 submit_mode=submit_mode,
+                test_mode=args.test_mode,
+                sms_scene=args.sms_scene,
             )
         else:
-            # 固定并发模式
-            await run_fixed_load_test(config, ip_pool, stats, submit_mode=submit_mode)
+            await run_fixed_load_test(
+                config, ip_pool, stats,
+                submit_mode=submit_mode,
+                test_mode=args.test_mode,
+                sms_scene=args.sms_scene,
+                burst=args.burst,
+            )
     except Exception as e:
         logging.getLogger().error(f"测试执行出错: {e}", exc_info=True)
     finally:

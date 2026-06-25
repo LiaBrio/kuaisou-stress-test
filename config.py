@@ -53,7 +53,11 @@ class StressTestConfig:
     use_freeproxy: bool = False           # 启用 FreeProxy 内置代理抓取(无需Docker)
     freeproxy_https_only: bool = False    # FreeProxy仅获取HTTPS代理(默认False: HTTP代理也能通过CONNECT转发HTTPS)
     proxy_validate_url: str = "https://httpbin.org/ip"
-    proxy_validate_timeout: int = 10     # 代理验证超时(秒)
+    proxy_validate_timeout: int = 8      # 代理验证超时(秒)
+    proxy_validate_concurrency: int = 30 # 验证并发数
+    proxy_validate_retry: int = 1        # 验证失败重试次数
+    proxy_validate_target: bool = True   # 是否用目标站URL验证(优先于通用URL)
+    proxy_multi_source: bool = False     # 启用多源抓取(替代FreeProxy单源)
     proxy_max_fails: int = 3             # 代理最大失败次数后移除
     proxy_rotate_strategy: str = "round_robin"  # round_robin / random / least_used / proxy_pool
     proxy_refresh_interval: int = 60     # 从proxy_pool刷新代理的间隔(秒)

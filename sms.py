@@ -1,8 +1,8 @@
 """
-注册流程模拟模块
-适配快搜实际接口: POST /admin/api/register
-Body: {"mobile": "手机号", "password": "密码"}
-响应: {"success": true/false, "error": "错误信息"}
+短信验证码接口模拟模块
+适配快搜接口: POST /admin/api/send-code
+Body: {"account": "手机号", "scene": "auto"}
+响应: {"success": true/false, "message": "验证码发送成功", "ttl": 300, "type": "register"}
 """
 import asyncio
 import json
@@ -10,62 +10,46 @@ import random
 import string
 import time
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from dataclasses import dataclass
 
 import aiohttp
-from faker import Faker
 
 from config import StressTestConfig
 from ip_pool import IPPoolManager
+from register import USER_AGENTS
 
-logger = logging.getLogger("register")
-
-# User-Agent 池
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-]
+logger = logging.getLogger("sms")
 
 
 @dataclass
-class RegisterResult:
-    """单次注册结果"""
+class SendCodeResult:
+    """单次发送验证码结果"""
     task_id: int
     success: bool
     status_code: Optional[int] = None
     response_time_ms: float = 0.0
-    error_type: Optional[str] = None      # timeout / captcha / network / http_error / other
+    error_type: Optional[str] = None
     error_message: Optional[str] = None
     proxy_used: Optional[str] = None
     timestamp: float = 0.0
     account_used: Optional[str] = None
+    ttl: Optional[int] = None          # 验证码有效期(秒)
+    code_type: Optional[str] = None    # register/login等
 
 
-class RegisterSimulator:
-    """注册流程模拟器 - 适配快搜 /admin/api/register 接口"""
+class SendCodeSimulator:
+    """短信验证码发送模拟器 - 适配快搜 /admin/api/send-code 接口"""
 
     def __init__(self, config: StressTestConfig, ip_pool: IPPoolManager,
-                 submit_mode: str = "json"):
-        """
-        Args:
-            submit_mode: 提交模式 (快搜接口固定为json)
-        """
+                 scene: str = "auto"):
         self.config = config
         self.ip_pool = ip_pool
-        self.faker = Faker(["zh_CN", "en_US"])
         self._task_counter = 0
-        self.submit_mode = submit_mode
-        self._session = None  # 共享Session（延迟初始化）
-        self._used_phones = set()  # 已用手机号去重
+        self.scene = scene
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._used_phones: set = set()  # 去重集合，确保号码唯一
 
-        # 手机号前缀池
         self._phone_prefixes = [
             "130", "131", "132", "133", "134", "135", "136", "137",
             "138", "139", "150", "151", "152", "153", "155",
@@ -74,17 +58,39 @@ class RegisterSimulator:
             "182", "183", "184", "185", "186", "187", "188", "189",
         ]
 
+    def _generate_mobile(self) -> str:
+        """生成随机手机号，确保不重复"""
+        for _ in range(100):  # 最多重试100次
+            prefix = random.choice(self._phone_prefixes)
+            suffix = "".join(random.choices(string.digits, k=8))
+            mobile = prefix + suffix
+            if mobile not in self._used_phones:
+                self._used_phones.add(mobile)
+                return mobile
+        # 极端情况：加时间戳后缀保证唯一
+        ts = str(int(time.time() * 1000))[-8:]
+        prefix = random.choice(self._phone_prefixes)
+        mobile = prefix + ts
+        self._used_phones.add(mobile)
+        return mobile
+
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取共享Session（延迟初始化，避免event loop冲突）"""
+        """获取共享Session（连接池复用）"""
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
-                limit=0, limit_per_host=0, ttl_dns_cache=300, ssl=False,
+                limit=0,           # 不限制总连接数
+                limit_per_host=0,  # 不限制单host连接数
+                ttl_dns_cache=300,
+                ssl=False,
             )
             timeout = aiohttp.ClientTimeout(
                 connect=self.config.connect_timeout,
                 total=self.config.read_timeout,
             )
-            self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
         return self._session
 
     async def close(self):
@@ -92,49 +98,7 @@ class RegisterSimulator:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    def _generate_mobile(self) -> str:
-        """生成随机手机号（去重）"""
-        for _ in range(100):
-            prefix = random.choice(self._phone_prefixes)
-            suffix = "".join(random.choices(string.digits, k=8))
-            mobile = prefix + suffix
-            if mobile not in self._used_phones:
-                self._used_phones.add(mobile)
-                return mobile
-        # fallback: 用时间戳确保唯一
-        ts = str(int(time.time() * 1000))[-8:]
-        prefix = random.choice(self._phone_prefixes)
-        mobile = prefix + ts
-        self._used_phones.add(mobile)
-        return mobile
-
-    def _generate_user_data(self) -> Dict[str, str]:
-        """生成注册数据"""
-        mobile = self._generate_mobile()
-        password = self._generate_password()
-
-        return {
-            self.config.register_fields["mobile"]: mobile,
-            self.config.register_fields["password"]: password,
-        }
-
-    def _generate_password(self) -> str:
-        """生成随机密码"""
-        length = random.randint(10, 16)
-        chars = string.ascii_letters + string.digits + "!@#$%"
-        # 确保包含大小写字母和数字
-        password = [
-            random.choice(string.ascii_uppercase),
-            random.choice(string.ascii_lowercase),
-            random.choice(string.digits),
-            random.choice("!@#$%"),
-        ]
-        password += random.choices(chars, k=length - 4)
-        random.shuffle(password)
-        return "".join(password)
-
     def _get_headers(self) -> Dict[str, str]:
-        """生成请求头 - 匹配浏览器实际请求"""
         headers = {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -146,28 +110,21 @@ class RegisterSimulator:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-
         if self.config.user_agent_rotate:
             headers["User-Agent"] = random.choice(USER_AGENTS)
         else:
             headers["User-Agent"] = USER_AGENTS[0]
-
         return headers
 
-    async def execute_register(self) -> RegisterResult:
-        """执行一次注册请求 (POST /admin/api/register)"""
+    async def execute_send_code(self) -> SendCodeResult:
+        """执行一次发送验证码请求"""
         self._task_counter += 1
         task_id = self._task_counter
         start_time = time.time()
 
-        # 获取代理
         proxy_url = await self.ip_pool.get_proxy()
+        mobile = self._generate_mobile()
 
-        # 生成注册数据
-        user_data = self._generate_user_data()
-        account_used = user_data.get(self.config.register_fields["mobile"], "unknown")
-
-        # 随机延迟(反爬虫)
         if self.config.random_delay:
             delay = random.uniform(
                 self.config.request_interval_min,
@@ -177,24 +134,24 @@ class RegisterSimulator:
 
         headers = self._get_headers()
 
-        result = RegisterResult(
+        payload = {"account": mobile, "scene": self.scene}
+
+        result = SendCodeResult(
             task_id=task_id,
             success=False,
             proxy_used=proxy_url,
             timestamp=start_time,
-            account_used=account_used,
+            account_used=mobile,
         )
 
         try:
             session = await self._get_session()
-            # 提交注册请求
             request_start = time.time()
             async with session.post(
-                self.config.register_url,
+                self.config.send_code_url,
                 proxy=proxy_url,
                 headers=headers,
-                json=user_data,
-                ssl=False,
+                json=payload,
                 allow_redirects=False,
             ) as resp:
                 response_time = (time.time() - request_start) * 1000
@@ -202,15 +159,16 @@ class RegisterSimulator:
                 result.response_time_ms = response_time
                 body = await resp.text()
 
-                # 快搜接口: HTTP始终200，通过JSON body的success字段判断
                 if resp.status == 200:
                     try:
                         data = json.loads(body)
                         if data.get("success") is True:
                             result.success = True
+                            result.ttl = data.get("ttl")
+                            result.code_type = data.get("type")
                             await self.ip_pool.report_success(proxy_url, response_time)
                         else:
-                            error_msg = data.get("error", "")
+                            error_msg = data.get("error") or data.get("message") or ""
                             result.error_type = self._classify_error(error_msg)
                             result.error_message = error_msg[:200]
                             await self.ip_pool.report_failure(proxy_url)
@@ -228,7 +186,7 @@ class RegisterSimulator:
                     await self.ip_pool.report_failure(proxy_url)
                 elif resp.status == 503:
                     result.error_type = "server_overloaded"
-                    result.error_message = "服务不可用(可能过载)"
+                    result.error_message = "服务不可用"
                     await self.ip_pool.report_failure(proxy_url)
                 else:
                     result.error_type = "http_error"
@@ -260,17 +218,20 @@ class RegisterSimulator:
         return result
 
     def _classify_error(self, error_msg: str) -> str:
-        """对错误响应分类 (基于快搜实际返回的错误信息)"""
-        if "已注册" in error_msg or "已存在" in error_msg:
-            return "account_exists"
-        if "验证码" in error_msg:
-            return "captcha"
-        if "手机号" in error_msg or "邮箱" in error_msg or "格式" in error_msg:
-            return "validation_error"
-        if "频繁" in error_msg or "限制" in error_msg or "流控" in error_msg:
+        """对错误响应分类"""
+        msg = error_msg.lower() if error_msg else ""
+        # IP限频优先判断
+        if "IP" in error_msg or "ip" in msg:
+            if "上限" in error_msg or "限制" in error_msg or "已达" in error_msg:
+                return "ip_rate_limit"
+        if "频繁" in error_msg or "限制" in error_msg or "流控" in error_msg or "rate" in msg:
             return "rate_limit"
+        if "验证码" in error_msg and ("已发送" in error_msg or "重复发送" in error_msg or "已发" in error_msg and "达" not in error_msg):
+            return "already_sent"
+        if "手机号" in error_msg or "格式" in error_msg or "invalid" in msg:
+            return "validation_error"
         if "封禁" in error_msg or "禁止" in error_msg:
             return "blocked"
-        if "服务器" in error_msg or "内部" in error_msg:
+        if "服务器" in error_msg or "内部" in error_msg or "500" in error_msg:
             return "server_error"
         return "unknown_error"

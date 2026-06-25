@@ -21,6 +21,16 @@ env/
 *.log
 stress_report_*.json
 stress_test_report.json
+burst_*.json
+
+# Proxy pool data
+proxy_pool.json
+scdn_*.txt
+sub_raw.txt
+
+# Xray/Sing-box config (contains subscription links)
+xray-config.json
+sing-box-config.json
 
 # Database (FreeProxy)
 *.db
